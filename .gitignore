@@ -1,0 +1,42 @@
+# Python / Backend
+backend/.venv/
+backend/__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.env
+.DS_Store
+
+# Node / Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/dist-ssr/
+frontend/*.local
+frontend/.npm/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# DeepFilterNet specific caching
+~/.cache/DeepFilterNet/
+*.wav
+*.mp3
+*.flac
+*.ogg
