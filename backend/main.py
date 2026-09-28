@@ -21,7 +21,7 @@ import numpy as np
 import soundfile as sf
 from scipy.signal import resample_poly
 
-from onnx_enhancer import OnnxEnhancer, StreamingEnhancer
+from onnx_enhancer import OnnxEnhancer, StreamingEnhancer, ParallelOnnxEnhancer
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -43,9 +43,10 @@ WS_DONE_SENTINEL = struct.pack("<I", 0xFFFFFFFF)
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Load ONNX model at startup; store in app.state."""
+    """Load ONNX models at startup; store in app.state."""
     print("Loading DeepFilterNet3 ONNX model …")
     app.state.onnx_model = OnnxEnhancer(model_dir="onnx_model")
+    app.state.parallel_model = ParallelOnnxEnhancer(model_dir="onnx_model", num_workers=4)
     print("Model ready.")
     yield
 
@@ -126,7 +127,9 @@ async def process_audio(
             input_tmp = f_in.name
 
         waveform, sr = prepare_audio(input_tmp)
-        enhanced_np = await asyncio.to_thread(app.state.onnx_model.enhance, waveform)
+        
+        # Use parallel processing for fast execution on large files
+        enhanced_np = await asyncio.to_thread(app.state.parallel_model.process, waveform, sr)
 
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as f_out:
             output_tmp = f_out.name

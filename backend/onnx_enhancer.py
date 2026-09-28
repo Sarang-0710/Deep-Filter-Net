@@ -421,3 +421,76 @@ class StreamingEnhancer:
         self._tail    = np.zeros(0, dtype=np.float32)
         self._ctx_buf = np.zeros(self._ctx_samples, dtype=np.float32)
         return result
+
+# ---------------------------------------------------------------------------
+# Parallel Enhancer (for fast full-file processing)
+# ---------------------------------------------------------------------------
+from concurrent.futures import ThreadPoolExecutor
+
+class ParallelOnnxEnhancer:
+    """
+    Splits long audio files into chunks and processes them in parallel across multiple 
+    CPU threads using independent ONNX instances. This is ideal for getting the full 
+    denoised audio in < 1 second for downstream tasks like STT.
+    """
+    def __init__(self, model_dir: str, num_workers: int = 4):
+        self.num_workers = num_workers
+        self.workers = []
+        
+        # Initialize multiple ONNX instances for parallel processing
+        # Important: Set threads to 1 per instance so they don't fight for CPU cores
+        for _ in range(num_workers):
+            opts = ort.SessionOptions()
+            opts.inter_op_num_threads = 1
+            opts.intra_op_num_threads = 1
+            opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            
+            enhancer = OnnxEnhancer(model_dir=model_dir)
+            
+            # Re-initialize the ONNX sessions on this specific enhancer with the single-thread options
+            def _sess(name: str):
+                return ort.InferenceSession(
+                    str(Path(model_dir) / name), 
+                    sess_options=opts, 
+                    providers=["CPUExecutionProvider"]
+                )
+            enhancer._enc     = _sess("enc.onnx")
+            enhancer._erb_dec = _sess("erb_dec.onnx")
+            enhancer._df_dec  = _sess("df_dec.onnx")
+            
+            self.workers.append(enhancer)
+            
+    def process(self, audio_data: np.ndarray, sample_rate: int = 48000) -> np.ndarray:
+        total_len = len(audio_data)
+        if total_len == 0:
+            return audio_data
+            
+        chunk_size = total_len // self.num_workers
+        if chunk_size == 0:
+            return self.workers[0].enhance(audio_data)
+            
+        # DeepFilterNet needs 1 second of context
+        ctx_samples = sample_rate * 1  
+        
+        def process_chunk(worker_idx):
+            start_idx = worker_idx * chunk_size
+            end_idx = start_idx + chunk_size if worker_idx < self.num_workers - 1 else total_len
+            
+            # Prepend 1 second of context to avoid glitches at boundaries
+            process_start = max(0, start_idx - ctx_samples)
+            actual_context_added = start_idx - process_start
+            
+            chunk_audio = audio_data[process_start:end_idx]
+            
+            # Denoise using this specific thread's ONNX instance
+            enhanced = self.workers[worker_idx].enhance(chunk_audio)
+            
+            # Remove context from the output
+            if actual_context_added > 0:
+                return enhanced[actual_context_added:]
+            return enhanced
+
+        with ThreadPoolExecutor(max_workers=self.num_workers) as pool:
+            results = list(pool.map(process_chunk, range(self.num_workers)))
+            
+        return np.concatenate(results)

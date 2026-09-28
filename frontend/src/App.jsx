@@ -5,7 +5,7 @@ const ALLOWED_EXT   = ['.wav', '.mp3', '.flac', '.ogg', '.m4a']
 // Derive WebSocket URL from current page origin so it works through Vite proxy
 const WS_URL        = `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/api/stream`
 const TARGET_SR     = 48000
-const CHUNK_SEC     = 0.5      // seconds per streaming chunk
+const CHUNK_SEC     = 4.0      // seconds per streaming chunk
 const DONE_SENTINEL = 0xFFFFFFFF
 
 function isAllowedFile(file) {
@@ -69,6 +69,13 @@ export default function App() {
   const [dragOver, setDragOver]     = useState(false)
   const [progress, setProgress]     = useState(0)    // 0–100
   const [statusText, setStatusText] = useState('')
+  
+  // Stopwatch state
+  const [latencyMs, setLatencyMs]       = useState(null)
+  const [timerRunning, setTimerRunning] = useState(false)
+  
+  const startTimeRef    = useRef(null)
+  const firstChunkRef   = useRef(false)
 
   const fileInputRef  = useRef(null)
   const wsRef         = useRef(null)
@@ -81,6 +88,19 @@ export default function App() {
     wsRef.current?.close()
     audioCtxRef.current?.close()
   }, [])
+
+  // Timer loop for the stopwatch
+  useEffect(() => {
+    let frameId
+    const update = () => {
+      if (timerRunning && startTimeRef.current) {
+        setLatencyMs(Math.round(performance.now() - startTimeRef.current))
+        frameId = requestAnimationFrame(update)
+      }
+    }
+    if (timerRunning) frameId = requestAnimationFrame(update)
+    return () => cancelAnimationFrame(frameId)
+  }, [timerRunning])
 
   // ── File selection ────────────────────────────────────────────────────────
   const selectFile = useCallback((f) => {
@@ -148,6 +168,11 @@ export default function App() {
     setError(null)
     setProgress(0)
     setStatusText('Decoding audio…')
+    setLatencyMs(0)
+    setTimerRunning(true)
+    startTimeRef.current = performance.now()
+    firstChunkRef.current = false
+    
     if (resultUrl) { URL.revokeObjectURL(resultUrl); setResultUrl(null) }
 
     collectedRef.current  = []
@@ -206,6 +231,7 @@ export default function App() {
         const url  = URL.createObjectURL(blob)
         setResultUrl(url)
         setProcessing(false)
+        setTimerRunning(false)
         setProgress(100)
         setStatusText('Done!')
         ws.close()
@@ -221,6 +247,12 @@ export default function App() {
 
       // Received a denoised chunk — play it immediately
       if (frame.samples && frame.samples.length > 0) {
+        if (!firstChunkRef.current) {
+          firstChunkRef.current = true
+          setTimerRunning(false)
+          setLatencyMs(Math.round(performance.now() - startTimeRef.current))
+        }
+        
         const copy = frame.samples.slice()   // detach from buffer
         collectedRef.current.push(copy)
         scheduleChunk(copy)
@@ -244,10 +276,14 @@ export default function App() {
     ws.onerror = (e) => {
       setError('WebSocket error — is the backend running?')
       setProcessing(false)
+      setTimerRunning(false)
     }
 
     ws.onclose = () => {
-      if (processing) setProcessing(false)
+      if (processing) {
+        setProcessing(false)
+        setTimerRunning(false)
+      }
     }
 
   }, [file, processing, resultUrl, scheduleChunk, buildWavBlob])
@@ -325,6 +361,14 @@ export default function App() {
             '✨ Clean Audio'
           )}
         </button>
+
+        {/* Stopwatch display */}
+        {latencyMs !== null && (
+          <div style={{ textAlign: 'center', marginTop: '12px', fontSize: '0.9rem', color: 'var(--text-muted)' }}>
+            ⏱️ Time to first audio: <strong style={{ color: 'var(--accent)' }}>{latencyMs} ms</strong>
+            {timerRunning && <span style={{ opacity: 0.6 }}> (waiting...)</span>}
+          </div>
+        )}
 
         {/* Progress bar */}
         {processing && (
