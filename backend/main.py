@@ -1,9 +1,9 @@
 """
-DeepFilterNet audio denoising backend.
+DeepFilterNet audio denoising backend — ONNX Runtime edition.
 
-Startup: loads the DeepFilterNet3 model once via init_df().
+Startup: loads the ONNX model (deepfilternet3_mask_only.onnx) once.
 POST /api/process: accepts an audio file, resamples to 48 kHz mono,
-                   runs enhance(), and streams back the cleaned wav.
+                   runs OnnxEnhancer.enhance(), streams back the cleaned wav.
 GET  /api/health : simple health check.
 """
 
@@ -13,13 +13,12 @@ import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import numpy as np
 import soundfile as sf
-import torch
-import torchaudio
+from scipy.signal import resample_poly
+from math import gcd
 
-# Tune CPU threads for maximum speed (4 threads is the sweet spot from benchmarks)
-torch.set_num_threads(4)
-from df.enhance import enhance, init_df
+from onnx_enhancer import OnnxEnhancer
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -38,12 +37,9 @@ TARGET_SR = 48_000
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Load DeepFilterNet3 model at startup; store in app.state."""
-    print("Loading DeepFilterNet3 model …")
-    model, df_state, _ = init_df()
-    model.eval()
-    app.state.model = model
-    app.state.df_state = df_state
+    """Load ONNX model at startup; store in app.state."""
+    print("Loading DeepFilterNet3 ONNX model …")
+    app.state.onnx_model = OnnxEnhancer(model_dir="onnx_model")
     print("Model ready.")
     yield
     # Nothing to clean up — model lives in RAM until process exits
@@ -69,27 +65,20 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 # Helper: resample + convert to mono at 48 kHz
 # ---------------------------------------------------------------------------
-def prepare_audio(path: str) -> tuple[torch.Tensor, int]:
+def prepare_audio(path: str) -> tuple[np.ndarray, int]:
     """
-    Load an audio file, convert to mono, resample to TARGET_SR.
-    Uses soundfile to avoid torchaudio 2.11's TorchCodec dependency.
-    Returns (waveform [1, T], sample_rate).
+    Load an audio file, convert to mono float32, resample to TARGET_SR.
+    Returns (waveform [T], sample_rate).
     """
-    import numpy as np
+    data, sr = sf.read(path, always_2d=True)  # [T, C] float64
+    data = data.mean(axis=1).astype(np.float32)  # mono, float32
 
-    data, sr = sf.read(path, always_2d=True)  # shape: [T, C], float64
-    data = data.T  # shape: [C, T]
-    waveform = torch.from_numpy(data).float()
-
-    # Convert to mono by averaging channels
-    if waveform.shape[0] > 1:
-        waveform = waveform.mean(dim=0, keepdim=True)
-
-    # Resample if needed using torchaudio.functional (doesn't need TorchCodec)
     if sr != TARGET_SR:
-        waveform = torchaudio.functional.resample(waveform, orig_freq=sr, new_freq=TARGET_SR)
+        g = gcd(TARGET_SR, sr)
+        up, down = TARGET_SR // g, sr // g
+        data = resample_poly(data, up, down).astype(np.float32)
 
-    return waveform, TARGET_SR
+    return data, TARGET_SR
 
 
 # ---------------------------------------------------------------------------
@@ -138,14 +127,11 @@ async def process_audio(
             input_tmp = f_in.name
 
         # --- Prepare audio (resample + mono) ---
-        waveform, sr = prepare_audio(input_tmp)
+        waveform, sr = prepare_audio(input_tmp)   # numpy [T] float32, 48 kHz
 
-        # --- Run DeepFilterNet inference ---
-        model = app.state.model
-        df_state = app.state.df_state
-
-        with torch.no_grad():
-            enhanced = enhance(model, df_state, waveform)
+        # --- Run ONNX inference ---
+        onnx_model = app.state.onnx_model
+        enhanced_np = onnx_model.enhance(waveform)  # numpy [T] float32
 
         # --- Write result to temp wav file ---
         with tempfile.NamedTemporaryFile(
@@ -153,13 +139,7 @@ async def process_audio(
         ) as f_out:
             output_tmp = f_out.name
 
-        # enhanced shape: [C, T] or [T] — flatten to [T] for soundfile
-        audio_np = enhanced.cpu().squeeze().numpy()  # [T] or [C, T]
-        if audio_np.ndim == 2:
-            audio_np = audio_np.T  # soundfile wants [T, C]
-
-        # Use soundfile to write WAV — avoids torchaudio 2.11 TorchCodec dependency
-        sf.write(output_tmp, audio_np, sr, subtype="PCM_16")
+        sf.write(output_tmp, enhanced_np, sr, subtype="PCM_16")
 
         # Schedule cleanup AFTER the response is sent
         background_tasks.add_task(cleanup_files, input_tmp, output_tmp)
