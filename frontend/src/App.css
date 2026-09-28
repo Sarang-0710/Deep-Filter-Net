@@ -1,3 +1,5 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
 /* ───────────────────────────────────────────
    Reset & base
 ─────────────────────────────────────────── */
@@ -20,8 +22,6 @@
   font-family: 'Inter', system-ui, -apple-system, sans-serif;
 }
 
-/* Import Inter from Google Fonts */
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
 
 html, body, #root {
   min-height: 100vh;
@@ -288,4 +288,28 @@ html, body, #root {
 
 .app-footer a:hover {
   text-decoration: underline;
+}
+
+/* ── Progress bar ── */
+.progress-bar-wrap {
+  width: 100%;
+  height: 6px;
+  background: var(--surface-2);
+  border-radius: 99px;
+  overflow: hidden;
+  margin-top: 12px;
+}
+
+.progress-bar-fill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--accent) 0%, var(--accent-hover) 100%);
+  border-radius: 99px;
+  transition: width 0.3s ease;
+}
+
+/* ── Progress % inside button ── */
+.progress-pct {
+  margin-left: 6px;
+  font-size: 0.85em;
+  opacity: 0.75;
 }

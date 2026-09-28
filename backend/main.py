@@ -1,35 +1,41 @@
 """
 DeepFilterNet audio denoising backend — ONNX Runtime edition.
 
-Startup: loads the ONNX model (deepfilternet3_mask_only.onnx) once.
-POST /api/process: accepts an audio file, resamples to 48 kHz mono,
-                   runs OnnxEnhancer.enhance(), streams back the cleaned wav.
-GET  /api/health : simple health check.
+Endpoints:
+  POST /api/process      — full-file upload → denoised WAV download
+  WS   /api/stream       — streaming: send raw Float32 PCM frames, receive denoised frames
+  GET  /api/health       — health check
 """
 
+import asyncio
+import io
 import os
 import shutil
+import struct
 import tempfile
 from contextlib import asynccontextmanager
+from math import gcd
 from pathlib import Path
 
 import numpy as np
 import soundfile as sf
 from scipy.signal import resample_poly
-from math import gcd
 
-from onnx_enhancer import OnnxEnhancer
-from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
+from onnx_enhancer import OnnxEnhancer, StreamingEnhancer
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
 # ---------------------------------------------------------------------------
-# Allowed audio extensions
+# Constants
 # ---------------------------------------------------------------------------
 ALLOWED_EXTENSIONS = {".wav", ".mp3", ".flac", ".ogg", ".m4a"}
+TARGET_SR          = 48_000   # DeepFilterNet expects 48 kHz mono
 
-# DeepFilterNet expects 48 kHz mono
-TARGET_SR = 48_000
+# WebSocket protocol constants
+# Client sends: 4-byte little-endian uint32 (num_samples) + num_samples * 4 bytes float32
+# Server sends: same format with denoised samples, OR a 4-byte 0xFFFFFFFF sentinel (done)
+WS_DONE_SENTINEL = struct.pack("<I", 0xFFFFFFFF)
 
 
 # ---------------------------------------------------------------------------
@@ -42,13 +48,12 @@ async def lifespan(app: FastAPI):
     app.state.onnx_model = OnnxEnhancer(model_dir="onnx_model")
     print("Model ready.")
     yield
-    # Nothing to clean up — model lives in RAM until process exits
 
 
 app = FastAPI(title="DeepFilterNet Audio Denoiser", lifespan=lifespan)
 
 # ---------------------------------------------------------------------------
-# CORS — allow the Vite dev server and any localhost origin
+# CORS
 # ---------------------------------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
@@ -57,40 +62,39 @@ app.add_middleware(
         "http://127.0.0.1:5173",
         "http://localhost:3000",
     ],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
 # ---------------------------------------------------------------------------
-# Helper: resample + convert to mono at 48 kHz
+# Helpers
 # ---------------------------------------------------------------------------
 def prepare_audio(path: str) -> tuple[np.ndarray, int]:
-    """
-    Load an audio file, convert to mono float32, resample to TARGET_SR.
-    Returns (waveform [T], sample_rate).
-    """
-    data, sr = sf.read(path, always_2d=True)  # [T, C] float64
-    data = data.mean(axis=1).astype(np.float32)  # mono, float32
-
+    """Load audio file → mono float32 @ 48 kHz."""
+    data, sr = sf.read(path, always_2d=True)
+    data = data.mean(axis=1).astype(np.float32)
     if sr != TARGET_SR:
         g = gcd(TARGET_SR, sr)
-        up, down = TARGET_SR // g, sr // g
-        data = resample_poly(data, up, down).astype(np.float32)
-
+        data = resample_poly(data, TARGET_SR // g, sr // g).astype(np.float32)
     return data, TARGET_SR
 
 
-# ---------------------------------------------------------------------------
-# Helper: delete a list of file paths (used as a BackgroundTask)
-# ---------------------------------------------------------------------------
 def cleanup_files(*paths: str) -> None:
     for p in paths:
         try:
             if p and os.path.exists(p):
                 os.remove(p)
         except Exception:
-            pass  # Best-effort cleanup
+            pass
+
+
+def encode_frame(samples: np.ndarray) -> bytes:
+    """Pack float32 array as: [uint32 count][float32 * count]"""
+    arr = samples.astype(np.float32)
+    header = struct.pack("<I", len(arr))
+    return header + arr.tobytes()
 
 
 # ---------------------------------------------------------------------------
@@ -106,7 +110,7 @@ async def process_audio(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
 ):
-    # --- Validate extension ---
+    """Full-file upload → denoised WAV download (kept for backwards compat)."""
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in ALLOWED_EXTENSIONS:
         raise HTTPException(
@@ -115,45 +119,99 @@ async def process_audio(
                    f"Allowed: {', '.join(sorted(ALLOWED_EXTENSIONS))}",
         )
 
-    input_tmp = None
-    output_tmp = None
-
+    input_tmp = output_tmp = None
     try:
-        # --- Save upload to temp file ---
-        with tempfile.NamedTemporaryFile(
-            delete=False, suffix=suffix
-        ) as f_in:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f_in:
             shutil.copyfileobj(file.file, f_in)
             input_tmp = f_in.name
 
-        # --- Prepare audio (resample + mono) ---
-        waveform, sr = prepare_audio(input_tmp)   # numpy [T] float32, 48 kHz
+        waveform, sr = prepare_audio(input_tmp)
+        enhanced_np = await asyncio.to_thread(app.state.onnx_model.enhance, waveform)
 
-        # --- Run ONNX inference ---
-        onnx_model = app.state.onnx_model
-        enhanced_np = onnx_model.enhance(waveform)  # numpy [T] float32
-
-        # --- Write result to temp wav file ---
-        with tempfile.NamedTemporaryFile(
-            delete=False, suffix=".wav"
-        ) as f_out:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as f_out:
             output_tmp = f_out.name
-
         sf.write(output_tmp, enhanced_np, sr, subtype="PCM_16")
 
-        # Schedule cleanup AFTER the response is sent
         background_tasks.add_task(cleanup_files, input_tmp, output_tmp)
-
-        return FileResponse(
-            path=output_tmp,
-            media_type="audio/wav",
-            filename="denoised.wav",
-        )
+        return FileResponse(path=output_tmp, media_type="audio/wav", filename="denoised.wav")
 
     except HTTPException:
-        # Clean up immediately on known errors
         cleanup_files(input_tmp, output_tmp)
         raise
     except Exception as exc:
         cleanup_files(input_tmp, output_tmp)
         raise HTTPException(status_code=500, detail=f"Processing failed: {exc}") from exc
+
+
+@app.websocket("/api/stream")
+async def stream_audio(ws: WebSocket):
+    """
+    WebSocket streaming endpoint.
+
+    Protocol (binary frames only):
+      CLIENT → SERVER:
+        • Each message = [uint32 n_samples LE][float32 * n_samples]  — raw PCM chunk @ 48 kHz mono
+        • Special: n_samples == 0xFFFFFFFF  →  end-of-stream signal
+
+      SERVER → CLIENT:
+        • Each message = [uint32 n_samples LE][float32 * n_samples]  — denoised PCM
+        • Final message = [uint32 0xFFFFFFFF]                        — done sentinel
+
+    The client is responsible for:
+      1. Decoding its audio file with AudioContext.decodeAudioData (→ 48 kHz mono if possible)
+      2. Sending the first chunk as a prewarm frame (server discards it from output)
+      3. Sending subsequent chunks and playing received denoised frames via Web Audio API
+    """
+    await ws.accept()
+
+    enhancer = StreamingEnhancer(model_dir="onnx_model", context_sec=1.0)
+    prewarm_done = False
+
+    try:
+        while True:
+            raw = await ws.receive_bytes()
+
+            if len(raw) < 4:
+                break
+
+            n_samples = struct.unpack_from("<I", raw, 0)[0]
+
+            # End-of-stream sentinel
+            if n_samples == 0xFFFFFFFF:
+                # Flush remaining tail
+                tail = await asyncio.to_thread(enhancer.flush)
+                if len(tail) > 0:
+                    await ws.send_bytes(encode_frame(tail))
+                await ws.send_bytes(WS_DONE_SENTINEL)
+                break
+
+            # Decode PCM payload
+            expected_bytes = 4 + n_samples * 4
+            if len(raw) < expected_bytes:
+                await ws.send_bytes(WS_DONE_SENTINEL)
+                break
+
+            chunk = np.frombuffer(raw[4:4 + n_samples * 4], dtype=np.float32).copy()
+
+            if not prewarm_done:
+                # First chunk is used as prewarm context only — no output sent
+                await asyncio.to_thread(enhancer.prewarm, chunk)
+                prewarm_done = True
+                # Acknowledge prewarm received (send 0-sample frame)
+                await ws.send_bytes(encode_frame(np.zeros(0, dtype=np.float32)))
+                continue
+
+            # Process chunk in a thread so the event loop stays responsive
+            denoised = await asyncio.to_thread(enhancer.push, chunk)
+
+            if len(denoised) > 0:
+                await ws.send_bytes(encode_frame(denoised))
+
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        print(f"[stream] error: {exc}")
+        try:
+            await ws.send_bytes(WS_DONE_SENTINEL)
+        except Exception:
+            pass

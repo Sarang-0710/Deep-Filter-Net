@@ -236,3 +236,188 @@ class OnnxEnhancer:
         # Trim: same delay compensation as PyTorch's enhance(pad=True):
         d = self.fft_size - self.hop_size
         return enhanced_audio[0, d : orig_len + d].astype(np.float32)
+
+
+# --------------------------------------------------------------------------- #
+# Streaming enhancer  (overlapping context-window strategy)
+# --------------------------------------------------------------------------- #
+
+class StreamingEnhancer:
+    """
+    Stateful streaming wrapper around the ONNX inference pipeline.
+
+    Maintains a rolling context buffer so each ONNX inference call receives
+    `context_sec` seconds of warm-up audio before the new chunk.  This
+    compensates for the GRU hidden states being reset on every ONNX call,
+    which would otherwise cause audible glitches / quality degradation at
+    chunk boundaries.
+
+    Usage
+    -----
+        se = StreamingEnhancer("onnx_model")
+        for raw_chunk in incoming_chunks:
+            denoised_chunk = se.push(raw_chunk)
+        last_block = se.flush()           # drain leftover samples at stream end
+    """
+
+    def __init__(
+        self,
+        model_dir="onnx_model",
+        context_sec: float = 1.0,
+    ):
+        model_dir = Path(model_dir)
+
+        opts = ort.SessionOptions()
+        opts.inter_op_num_threads = 1
+        opts.intra_op_num_threads = 4
+        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+
+        def _sess(name):
+            return ort.InferenceSession(
+                str(model_dir / name),
+                sess_options=opts,
+                providers=["CPUExecutionProvider"],
+            )
+
+        self._enc     = _sess("enc.onnx")
+        self._erb_dec = _sess("erb_dec.onnx")
+        self._df_dec  = _sess("df_dec.onnx")
+
+        self._erb_inv_fb = np.load(model_dir / "erb_inv_fb.npy")
+        self._alpha      = float(np.load(model_dir / "norm_alpha.npy")[0])
+        params           = np.load(model_dir / "params.npy", allow_pickle=True).item()
+
+        self.sr           = int(params["sr"])
+        self.fft_size     = int(params["fft_size"])
+        self.hop_size     = int(params["hop_size"])
+        self.nb_erb       = int(params["nb_erb"])
+        self.nb_df        = int(params["nb_df"])
+        self.df_order     = int(params.get("df_order", 5))
+        self.df_lookahead = int(params.get("df_lookahead", 2))
+
+        self._ctx_samples = int(context_sec * self.sr)
+        self._ctx_buf     = np.zeros(self._ctx_samples, dtype=np.float32)
+        self._tail        = np.zeros(0, dtype=np.float32)
+        # How many raw audio samples have been fed so far (for warmup tracking)
+        self._samples_fed: int = 0
+
+        _tmp = DF(sr=self.sr, fft_size=self.fft_size, hop_size=self.hop_size,
+                  nb_bands=self.nb_erb, min_nb_erb_freqs=2)
+        self._erb_fb = _tmp.erb_widths()
+
+        print(
+            f"StreamingEnhancer ready | sr={self.sr}  context={context_sec:.1f}s  "
+            f"df_order={self.df_order}"
+        )
+
+    # ── Internal ────────────────────────────────────────────────────────────
+
+    def _run_window(self, window: np.ndarray) -> np.ndarray:
+        """Run the full pipeline on a 1-D window. Returns raw synthesis output."""
+        audio_2d = window[np.newaxis, :]
+        df_state = DF(
+            sr=self.sr, fft_size=self.fft_size, hop_size=self.hop_size,
+            nb_bands=self.nb_erb, min_nb_erb_freqs=2,
+        )
+        spec        = df_state.analysis(audio_2d)
+        feat_erb_np = erb_norm(erb(spec, self._erb_fb), self._alpha)
+        feat_spec_c = unit_norm(spec[..., :self.nb_df], self._alpha)
+
+        feat_erb_in  = pad_feat(feat_erb_np[np.newaxis, :])
+        feat_spec_ri = np.stack(
+            [feat_spec_c.real, feat_spec_c.imag], axis=1
+        ).astype(np.float32)
+        feat_spec_in = pad_feat(feat_spec_ri)
+
+        e0, e1, e2, e3, emb, c0, lsnr = self._enc.run(
+            None, {"feat_erb": feat_erb_in, "feat_spec": feat_spec_in}
+        )
+        m     = self._erb_dec.run(None, {"emb": emb, "e3": e3, "e2": e2, "e1": e1, "e0": e0})[0]
+        coefs = self._df_dec.run(None, {"emb": emb, "c0": c0})[0]
+
+        mask_lin = m.squeeze(0).squeeze(0) @ self._erb_inv_fb
+        spec_m   = spec * mask_lin[np.newaxis, :, :]
+        spec_e   = _apply_df(spec_m, coefs, self.nb_df, self.df_order, self.df_lookahead)
+
+        return df_state.synthesis(spec_e)[0]   # [T_audio]
+
+    # ── Public API ──────────────────────────────────────────────────────────
+
+    def prewarm(self, audio: np.ndarray) -> None:
+        """
+        Feed up to `context_sec` seconds of audio as warm-up context.
+        This audio will NOT appear in the output stream — it is used only
+        to give the model meaningful history before the first real chunk.
+        Call this before the first push() for best quality on early chunks.
+
+        Example (when you have the whole file ahead of time):
+            se.prewarm(audio[:sr])   # first 1 second as context
+            for chunk in chunks:
+                out = se.push(chunk)
+        """
+        audio = _to_float32(audio)
+        if audio.ndim != 1:
+            raise ValueError(f"prewarm() expects 1-D audio, got shape {audio.shape}")
+        # Take only the last ctx_samples worth of audio
+        self._ctx_buf      = np.concatenate([self._ctx_buf, audio])[-self._ctx_samples:]
+        self._samples_fed += len(audio)
+
+    def push(self, chunk: np.ndarray) -> np.ndarray:
+        """
+        Feed the next raw audio chunk (float32, 48 kHz, mono).
+        Returns the denoised audio for the samples that were processed.
+        Chunks smaller than one hop_size are buffered and return empty array.
+        """
+        chunk = _to_float32(chunk)
+        if chunk.ndim != 1:
+            raise ValueError(f"push() expects 1-D audio, got shape {chunk.shape}")
+
+        chunk  = np.concatenate([self._tail, chunk])
+        n_hops = len(chunk) // self.hop_size
+        self._tail = chunk[n_hops * self.hop_size:]
+        chunk      = chunk[:n_hops * self.hop_size]
+
+        if n_hops == 0:
+            return np.zeros(0, dtype=np.float32)
+
+        chunk_len = len(chunk)
+        window    = np.concatenate([
+            self._ctx_buf,
+            chunk,
+            np.zeros(self.fft_size, dtype=np.float32),
+        ])
+
+        enh = self._run_window(window)
+
+        # d = algorithmic delay (fft_size - hop_size = 480 samples)
+        d         = self.fft_size - self.hop_size
+
+        # If we don't yet have a full context worth of real audio, the GRU
+        # warm-up will be partial.  We still extract at the correct offset,
+        # which avoids hard alignment bugs, but quality will be slightly lower
+        # for the first ~(ctx_samples / hop_size) chunks.
+        ctx_actual = min(self._ctx_samples, self._samples_fed)
+        out_start  = ctx_actual + d
+        out_end    = out_start + chunk_len
+
+        if out_end > len(enh):
+            enh = np.pad(enh, (0, out_end - len(enh)))
+
+        result = enh[out_start:out_end].astype(np.float32)
+
+        # Roll context buffer and update sample counter
+        self._ctx_buf      = np.concatenate([self._ctx_buf, chunk])[-self._ctx_samples:]
+        self._samples_fed += chunk_len
+        return result
+
+    def flush(self) -> np.ndarray:
+        """
+        Process any remaining tail samples and reset state.
+        Call once after the last push() at end-of-stream.
+        """
+        result = np.zeros(0, dtype=np.float32)
+        if len(self._tail) > 0:
+            result = self.push(self._tail)
+        self._tail    = np.zeros(0, dtype=np.float32)
+        self._ctx_buf = np.zeros(self._ctx_samples, dtype=np.float32)
+        return result
