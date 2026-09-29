@@ -1,63 +1,11 @@
-import { useState, useRef, useCallback, useEffect } from 'react'
+import { useState, useRef, useCallback } from 'react'
 
 const ALLOWED_TYPES = ['audio/wav', 'audio/mpeg', 'audio/flac', 'audio/ogg', 'audio/mp4', 'audio/x-m4a']
 const ALLOWED_EXT   = ['.wav', '.mp3', '.flac', '.ogg', '.m4a']
-// Derive WebSocket URL from current page origin so it works through Vite proxy
-const WS_URL        = `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/api/stream`
-const TARGET_SR     = 48000
-const CHUNK_SEC     = 4.0      // seconds per streaming chunk
-const DONE_SENTINEL = 0xFFFFFFFF
 
 function isAllowedFile(file) {
   if (ALLOWED_TYPES.includes(file.type)) return true
   return ALLOWED_EXT.some(ext => file.name.toLowerCase().endsWith(ext))
-}
-
-/** Decode an audio File to mono Float32Array at 48 kHz using Web Audio API */
-async function decodeAudioFile(file) {
-  const ctx    = new AudioContext({ sampleRate: TARGET_SR })
-  const buf    = await file.arrayBuffer()
-  const decoded = await ctx.decodeAudioData(buf)
-
-  // Mix down to mono
-  let mono
-  if (decoded.numberOfChannels === 1) {
-    mono = decoded.getChannelData(0).slice()
-  } else {
-    mono = new Float32Array(decoded.length)
-    for (let ch = 0; ch < decoded.numberOfChannels; ch++) {
-      const chData = decoded.getChannelData(ch)
-      for (let i = 0; i < decoded.length; i++) mono[i] += chData[i]
-    }
-    const inv = 1 / decoded.numberOfChannels
-    for (let i = 0; i < mono.length; i++) mono[i] *= inv
-  }
-  await ctx.close()
-  return mono   // Float32Array @ TARGET_SR, mono
-}
-
-/** Pack: [uint32 n_samples][float32 * n_samples] */
-function encodeFrame(samples) {
-  const buf = new ArrayBuffer(4 + samples.length * 4)
-  new DataView(buf).setUint32(0, samples.length, true)
-  new Float32Array(buf, 4).set(samples)
-  return buf
-}
-
-/** Send end-of-stream sentinel: [uint32 0xFFFFFFFF] */
-function eosFrame() {
-  const buf = new ArrayBuffer(4)
-  new DataView(buf).setUint32(0, DONE_SENTINEL, true)
-  return buf
-}
-
-/** Decode a server binary frame. Returns { done: true } or { samples: Float32Array } */
-function decodeFrame(data) {
-  const view    = new DataView(data)
-  const n       = view.getUint32(0, true)
-  if (n === DONE_SENTINEL) return { done: true }
-  if (n === 0)             return { samples: new Float32Array(0) }
-  return { samples: new Float32Array(data, 4, n) }
 }
 
 export default function App() {
@@ -67,47 +15,17 @@ export default function App() {
   const [resultUrl, setResultUrl]   = useState(null)
   const [error, setError]           = useState(null)
   const [dragOver, setDragOver]     = useState(false)
-  const [progress, setProgress]     = useState(0)    // 0–100
-  const [statusText, setStatusText] = useState('')
   
-  // Stopwatch state
-  const [latencyMs, setLatencyMs]       = useState(null)
-  const [timerRunning, setTimerRunning] = useState(false)
-  
-  const startTimeRef    = useRef(null)
-  const firstChunkRef   = useRef(false)
+  // Stopwatch for FULL file processing time
+  const [latencyMs, setLatencyMs]   = useState(null)
 
   const fileInputRef  = useRef(null)
-  const wsRef         = useRef(null)
-  const audioCtxRef   = useRef(null)
-  const nextPlayTime  = useRef(0)
-  const collectedRef  = useRef([])   // accumulated denoised samples for download
-
-  // Cleanup on unmount
-  useEffect(() => () => {
-    wsRef.current?.close()
-    audioCtxRef.current?.close()
-  }, [])
-
-  // Timer loop for the stopwatch
-  useEffect(() => {
-    let frameId
-    const update = () => {
-      if (timerRunning && startTimeRef.current) {
-        setLatencyMs(Math.round(performance.now() - startTimeRef.current))
-        frameId = requestAnimationFrame(update)
-      }
-    }
-    if (timerRunning) frameId = requestAnimationFrame(update)
-    return () => cancelAnimationFrame(frameId)
-  }, [timerRunning])
 
   // ── File selection ────────────────────────────────────────────────────────
   const selectFile = useCallback((f) => {
     setError(null)
     setResultUrl(null)
-    setProgress(0)
-    setStatusText('')
+    setLatencyMs(null)
     if (!isAllowedFile(f)) {
       setError('Unsupported file type. Please upload a WAV, MP3, FLAC, OGG, or M4A file.')
       return
@@ -123,177 +41,60 @@ export default function App() {
     if (e.dataTransfer.files[0]) selectFile(e.dataTransfer.files[0])
   }
 
-  // ── Play a denoised chunk via Web Audio API ───────────────────────────────
-  const scheduleChunk = useCallback((samples) => {
-    if (!audioCtxRef.current || samples.length === 0) return
-    const ctx      = audioCtxRef.current
-    const audioBuf = ctx.createBuffer(1, samples.length, TARGET_SR)
-    audioBuf.getChannelData(0).set(samples)
-    const src      = ctx.createBufferSource()
-    src.buffer     = audioBuf
-    src.connect(ctx.destination)
-
-    const now = ctx.currentTime
-    const startAt = Math.max(now, nextPlayTime.current)
-    src.start(startAt)
-    nextPlayTime.current = startAt + audioBuf.duration
-  }, [])
-
-  // ── Build downloadable WAV blob from accumulated PCM ─────────────────────
-  const buildWavBlob = useCallback(() => {
-    const all    = collectedRef.current
-    const total  = all.reduce((s, a) => s + a.length, 0)
-    const merged = new Float32Array(total)
-    let offset   = 0
-    for (const chunk of all) { merged.set(chunk, offset); offset += chunk.length }
-
-    // Minimal WAV header for 48kHz mono float32
-    const dataBytes  = merged.buffer.byteLength
-    const header     = new ArrayBuffer(44)
-    const view       = new DataView(header)
-    const writeStr   = (s, o) => { for (let i = 0; i < s.length; i++) view.setUint8(o + i, s.charCodeAt(i)) }
-    writeStr('RIFF', 0); view.setUint32(4, 36 + dataBytes, true)
-    writeStr('WAVE', 8); writeStr('fmt ', 12)
-    view.setUint32(16, 16, true);   view.setUint16(20, 3, true)   // PCM float
-    view.setUint16(22, 1, true);    view.setUint32(24, TARGET_SR, true)
-    view.setUint32(28, TARGET_SR * 4, true); view.setUint16(32, 4, true); view.setUint16(34, 32, true)
-    writeStr('data', 36); view.setUint32(40, dataBytes, true)
-    return new Blob([header, merged.buffer], { type: 'audio/wav' })
-  }, [])
-
-  // ── Main streaming handler ────────────────────────────────────────────────
-  const handleProcess = useCallback(async () => {
+  // ── Full File Processing (Multi-Agent Simulation) ──────────────────────────
+  const handleProcess = async () => {
     if (!file || processing) return
+    
     setProcessing(true)
     setError(null)
-    setProgress(0)
-    setStatusText('Decoding audio…')
-    setLatencyMs(0)
-    setTimerRunning(true)
-    startTimeRef.current = performance.now()
-    firstChunkRef.current = false
+    setLatencyMs(null)
     
-    if (resultUrl) { URL.revokeObjectURL(resultUrl); setResultUrl(null) }
+    if (resultUrl) { 
+        URL.revokeObjectURL(resultUrl); 
+        setResultUrl(null) 
+    }
 
-    collectedRef.current  = []
-    nextPlayTime.current  = 0
+    const startTime = performance.now()
 
-    // Create a fresh AudioContext for this session
-    if (audioCtxRef.current) await audioCtxRef.current.close()
-    audioCtxRef.current = new AudioContext({ sampleRate: TARGET_SR })
-    nextPlayTime.current = audioCtxRef.current.currentTime + 0.1
-
-    let pcm
     try {
-      pcm = await decodeAudioFile(file)
+      const formData = new FormData()
+      formData.append('file', file)
+
+      // This endpoint uses ParallelOnnxEnhancer under the hood!
+      const res = await fetch('/api/process', {
+        method: 'POST',
+        body: formData,
+      })
+
+      if (!res.ok) {
+        let msg = `Server error (${res.status})`
+        try {
+          const json = await res.json()
+          msg = json.detail || msg
+        } catch (_) {}
+        throw new Error(msg)
+      }
+
+      const blob = await res.blob()
+      
+      // Stop the stopwatch the exact moment the FULL file is received
+      const endTime = performance.now()
+      setLatencyMs(Math.round(endTime - startTime))
+      
+      setResultUrl(URL.createObjectURL(blob))
     } catch (err) {
-      setError('Failed to decode audio: ' + err.message)
+      setError(err.message)
+    } finally {
       setProcessing(false)
-      return
     }
-
-    const chunkSize    = Math.round(CHUNK_SEC * TARGET_SR)
-    const totalSamples = pcm.length
-    let sentSamples    = 0
-
-    setStatusText('Connecting…')
-
-    const ws = new WebSocket(WS_URL)
-    wsRef.current = ws
-    ws.binaryType = 'arraybuffer'
-
-    let prewarmAcked  = false
-    let chunkIndex    = 0
-    let prewarmChunk  = null
-
-    // Divide PCM into chunks. First chunk = prewarm context.
-    const chunks = []
-    for (let i = 0; i < totalSamples; i += chunkSize) {
-      chunks.push(pcm.subarray(i, Math.min(i + chunkSize, totalSamples)))
-    }
-    // First chunk is prewarm (at least 1s = 48000 samples; we use one chunk for simplicity)
-    prewarmChunk = chunks[0]
-    const dataChunks = chunks.slice(1)
-
-    ws.onopen = () => {
-      setStatusText('Processing…')
-      // Send prewarm frame
-      ws.send(encodeFrame(prewarmChunk))
-      sentSamples += prewarmChunk.length
-    }
-
-    ws.onmessage = (ev) => {
-      const frame = decodeFrame(ev.data)
-
-      if (frame.done) {
-        // All chunks processed — build WAV and offer download
-        const blob = buildWavBlob()
-        const url  = URL.createObjectURL(blob)
-        setResultUrl(url)
-        setProcessing(false)
-        setTimerRunning(false)
-        setProgress(100)
-        setStatusText('Done!')
-        ws.close()
-        return
-      }
-
-      if (!prewarmAcked) {
-        // Server acknowledged prewarm — now send real chunks one by one
-        prewarmAcked = true
-        sendNextChunk()
-        return
-      }
-
-      // Received a denoised chunk — play it immediately
-      if (frame.samples && frame.samples.length > 0) {
-        if (!firstChunkRef.current) {
-          firstChunkRef.current = true
-          setTimerRunning(false)
-          setLatencyMs(Math.round(performance.now() - startTimeRef.current))
-        }
-        
-        const copy = frame.samples.slice()   // detach from buffer
-        collectedRef.current.push(copy)
-        scheduleChunk(copy)
-      }
-
-      sentSamples += (dataChunks[chunkIndex - 1]?.length ?? 0)
-      setProgress(Math.round((chunkIndex / dataChunks.length) * 100))
-
-      sendNextChunk()
-    }
-
-    function sendNextChunk() {
-      if (chunkIndex >= dataChunks.length) {
-        ws.send(eosFrame())
-        return
-      }
-      const chunk = dataChunks[chunkIndex++]
-      ws.send(encodeFrame(chunk))
-    }
-
-    ws.onerror = (e) => {
-      setError('WebSocket error — is the backend running?')
-      setProcessing(false)
-      setTimerRunning(false)
-    }
-
-    ws.onclose = () => {
-      if (processing) {
-        setProcessing(false)
-        setTimerRunning(false)
-      }
-    }
-
-  }, [file, processing, resultUrl, scheduleChunk, buildWavBlob])
+  }
 
   // ── UI ────────────────────────────────────────────────────────────────────
   return (
     <div className="page">
       <header className="app-header">
-        <h1>DeepFilterNet Audio Denoiser</h1>
-        <p className="subtitle">Upload a noisy audio file — the model will clean it up in real time.</p>
+        <h1>DeepFilterNet (Parallel Agent Mode)</h1>
+        <p className="subtitle">This tests the standalone agent. The whole file is processed at once.</p>
       </header>
 
       <main className="card">
@@ -350,30 +151,16 @@ export default function App() {
           id="process-button"
         >
           {processing ? (
-            <>
-              <span className="spinner" aria-hidden="true" />
-              {statusText || 'Processing…'}
-              {progress > 0 && progress < 100 && (
-                <span className="progress-pct"> {progress}%</span>
-              )}
-            </>
+            <><span className="spinner" aria-hidden="true" /> Processing Full File…</>
           ) : (
-            '✨ Clean Audio'
+            '✨ Clean Audio (Parallel Mode)'
           )}
         </button>
 
         {/* Stopwatch display */}
         {latencyMs !== null && (
           <div style={{ textAlign: 'center', marginTop: '12px', fontSize: '0.9rem', color: 'var(--text-muted)' }}>
-            ⏱️ Time to first audio: <strong style={{ color: 'var(--accent)' }}>{latencyMs} ms</strong>
-            {timerRunning && <span style={{ opacity: 0.6 }}> (waiting...)</span>}
-          </div>
-        )}
-
-        {/* Progress bar */}
-        {processing && (
-          <div className="progress-bar-wrap" aria-hidden="true">
-            <div className="progress-bar-fill" style={{ width: `${progress}%` }} />
+            ⏱️ Total time for FULL processing: <strong style={{ color: 'var(--accent)' }}>{latencyMs} ms</strong>
           </div>
         )}
 
@@ -391,7 +178,7 @@ export default function App() {
 
       <footer className="app-footer">
         Powered by <a href="https://github.com/rikorose/DeepFilterNet" target="_blank" rel="noreferrer">DeepFilterNet3</a>
-        &nbsp;·&nbsp; Streaming via WebSocket
+        &nbsp;·&nbsp; Full File Parallel Processing
       </footer>
     </div>
   )
